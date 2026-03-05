@@ -6,7 +6,7 @@ from pydantic import SecretStr
 from task._constants import DIAL_URL, API_KEY
 from task.user_client import UserClient
 
-#TODO:
+# Note:
 # Before implementation open the `flow_diagram.png` to see the flow of app
 
 BATCH_SYSTEM_PROMPT = """You are a user search assistant. Your task is to find users from the provided list that match the search criteria.
@@ -54,61 +54,111 @@ class TokenTracker:
             'batch_tokens': self.batch_tokens
         }
 
-#TODO:
-# 1. Create AzureChatOpenAI client
-#    hint: api_version set as empty string if you gen an error that indicated that api_version cannot be None
-# 2. Create TokenTracker
+
+llm_client = AzureChatOpenAI(
+    # Basic, deterministic configuration suitable for experiments.
+    temperature=0.0,
+    azure_deployment="gpt-4o",
+    azure_endpoint=DIAL_URL,
+    api_key=SecretStr(API_KEY),
+    # Adjust this if your DIAL setup expects a different version.
+    api_version="2024-02-15-preview",
+)
+
+token_tracker = TokenTracker()
+
 
 def join_context(context: list[dict[str, Any]]) -> str:
-    #TODO:
-    # You cannot pass raw JSON with user data to LLM (" sign), collect it in just simple string or markdown.
-    # You need to collect it in such way:
-    # User:
-    #   name: John
-    #   surname: Doe
-    #   ...
-    raise NotImplementedError
+    context_str = ""
+    for user in context:
+        context_str += "User:\n"
+        for key, value in user.items():
+            context_str += f"  {key}: {value}\n"
+        context_str += "\n"
+    return context_str
 
 
 async def generate_response(system_prompt: str, user_message: str) -> str:
     print("Processing...")
-    #TODO:
-    # 1. Create messages array with system prompt and user message
-    # 2. Generate response (use `ainvoke`, don't forget to `await` the response)
-    # 3. Get usage (hint, usage can be found in response metadata (its dict) and has name 'token_usage', that is also
-    #    dict and there you need to get 'total_tokens')
-    # 4. Add tokens to `token_tracker`
-    # 5. Print response content and `total_tokens`
-    # 5. return response content
-    raise NotImplementedError
+    # 1. Create messages list for the chat model.
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_message),
+    ]
+
+    # 2. Call the model asynchronously.
+    response = await llm_client.ainvoke(messages)
+
+    # 3. Read token usage information if it is available.
+    token_usage = response.response_metadata.get("token_usage", {}) if hasattr(response, "response_metadata") else {}
+    total_tokens = token_usage.get("total_tokens", 0)
+
+    # 4. Track token usage for later summary.
+    if isinstance(total_tokens, int):
+        token_tracker.add_tokens(total_tokens)
+
+    # 5. Show the model answer and token usage.
+    print("\nModel response:")
+    print(response.content)
+    print(f"\nTokens used in this call: {total_tokens}")
+
+    # 6. Return raw content so the caller can work with it.
+    return response.content
 
 
 async def main():
     print("Query samples:")
     print(" - Do we have someone with name John that loves traveling?")
 
-    user_question = input("> ").strip()
+    # Run blocking input() in a worker thread so it does not block the event loop.
+    user_question = (await asyncio.to_thread(input, "> ")).strip()
     if user_question:
         print("\n--- Searching user database ---")
 
-        #TODO:
-        # 1. Get all users (use UserClient)
-        # 2. Split all users on batches (100 users in 1 batch). We need it since LLMs have its limited context window
-        # 3. Prepare tasks for async run of response generation for users batches:
-        #       - create array tasks
-        #       - iterate through `user_batches` and call `generate_response` with these params:
-        #           - BATCH_SYSTEM_PROMPT (system prompt)
-        #           - User prompt, you need to format USER_PROMPT with context from user batch and user question
-        # 4. Run task asynchronously, use method `gather` form `asyncio`
-        # 5. Filter results on 'NO_MATCHES_FOUND' (see instructions for BATCH_SYSTEM_PROMPT)
-        # 5. If results after filtration are present:
-        #       - combine filtered results with "\n\n" spliterator
-        #       - generate response with such params:
-        #           - FINAL_SYSTEM_PROMPT (system prompt)
-        #           - User prompt: you need to make augmentation of retrieved result and user question
-        # 6. Otherwise prin the info that `No users found matching`
-        # 7. In the end print info about usage, you will be impressed of how many tokens you have used. (imagine if we have 10k or 100k users 😅)
-    raise NotImplementedError
+        # 1. Get all users.
+        user_client = UserClient()
+        users = user_client.get_all_users()
+
+        # 2. Split users into batches of at most 100 users.
+        batch_size = 100
+        user_batches: list[list[dict[str, Any]]] = [
+            users[i : i + batch_size] for i in range(0, len(users), batch_size)
+        ]
+
+        # 3. Prepare asynchronous tasks: one LLM call per batch.
+        tasks: list[asyncio.Future[str]] = []
+        for user_batch in user_batches:
+            batch_context = join_context(user_batch)
+            user_message = USER_PROMPT.format(context=batch_context, query=user_question)
+            tasks.append(generate_response(system_prompt=BATCH_SYSTEM_PROMPT, user_message=user_message))
+
+        # 4. Run all batch searches in parallel.
+        batch_results = await asyncio.gather(*tasks)
+
+        # 5. Filter out batches that reported no matches.
+        relevant_results = [
+            result for result in batch_results if result.strip() != "NO_MATCHES_FOUND"
+        ]
+
+        # 6. If we have any matches, combine them and ask the model for a final answer.
+        if relevant_results:
+            combined_results = "\n\n".join(relevant_results)
+            final_message = (
+                f"SEARCH RESULTS:\n{combined_results}\n\nORIGINAL QUERY: {user_question}"
+            )
+            await generate_response(
+                system_prompt=FINAL_SYSTEM_PROMPT,
+                user_message=final_message,
+            )
+        else:
+            print("No users found matching the given search query.")
+
+        # 7. Show a short summary of token usage.
+        usage_summary = token_tracker.get_summary()
+        print("\n--- Token usage summary ---")
+        print(f"Total tokens: {usage_summary['total_tokens']}")
+        print(f"Number of batch calls: {usage_summary['batch_count']}")
+        print(f"Tokens per batch: {usage_summary['batch_tokens']}")
 
 
 if __name__ == "__main__":

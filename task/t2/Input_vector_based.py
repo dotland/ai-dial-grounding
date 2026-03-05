@@ -8,25 +8,40 @@ from pydantic import SecretStr
 from task._constants import DIAL_URL, API_KEY
 from task.user_client import UserClient
 
-#TODO:
+# Note:
 # Before implementation open the `vector_based_grounding.png` to see the flow of app
 
-#TODO:
-# Provide System prompt. Goal is to explain LLM that in the user message will be provide rag context that is retrieved
-# based on user question and user question and LLM need to answer to user based on provided context
-SYSTEM_PROMPT = """
+
+SYSTEM_PROMPT = """You are a RAG-powered assistant that assists users with their questions about user information.
+            
+## Structure of User message:
+`RAG CONTEXT` - Retrieved documents relevant to the query.
+`USER QUESTION` - The user's actual question.
+
+## Instructions:
+- Use information from `RAG CONTEXT` as context when answering the `USER QUESTION`.
+- Cite specific sources when using information from the context.
+- Answer ONLY based on conversation history and RAG context.
+- If no relevant information exists in `RAG CONTEXT` or conversation history, state that you cannot answer the question.
 """
 
-#TODO:
-# Should consist retrieved context and user question
-USER_PROMPT = """
-"""
+USER_PROMPT = """##RAG CONTEXT:
+{context}
+
+##USER QUESTION: 
+{query}"""
 
 
 def format_user_document(user: dict[str, Any]) -> str:
-    #TODO:
-    # Prepare context from users JSONs in the same way as in `no_grounding.py` `join_context` method (collect as one string)
-    raise NotImplementedError
+    """
+    Convert a single user dictionary into a readable text representation.
+
+    This mirrors the formatting used in `join_context` from `no_grounding.py`.
+    """
+    lines: list[str] = ["User:"]
+    for key, value in user.items():
+        lines.append(f"  {key}: {value}")
+    return "\n".join(lines)
 
 
 class UserRAG:
@@ -37,73 +52,149 @@ class UserRAG:
 
     async def __aenter__(self):
         print("🔎 Loading all users...")
-        #TODO:
-        # 1. Get all users (use UserClient)
-        # 2. Prepare array of Documents where page_content is `format_user_document(user)` (you need to iterate through users)
-        # 3. call `_create_vectorstore_with_batching` (don't forget that its async) and setup it as obj var `vectorstore`
+        # 1. Get all users from the service.
+        user_client = UserClient()
+        users = user_client.get_all_users()
+
+        # 2. Build one Document per user.
+        documents: list[Document] = [
+            Document(page_content=format_user_document(user)) for user in users
+        ]
+
+        print(f"↗️ Creating embeddings and vectorstore for {len(documents)} documents...")
+        # Create a FAISS vector store in batches to respect context limits.
+        self.vectorstore = await self._create_vectorstore_with_batching(documents)
         print("✅ Vectorstore is ready.")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        pass
+        # No async cleanup is required for the vectorstore at the moment.
+        # The method exists to keep the async context manager interface explicit.
+        return False
 
     async def _create_vectorstore_with_batching(self, documents: list[Document], batch_size: int = 100):
-        #TODO:
-        # 1. Split all `documents` on batches (100 documents in 1 batch). We need it since Embedding models have limited context window
-        # 2. Iterate through document batches and create array with tasks that will generate FAISS vector stores from documents:
-        #    https://api.python.langchain.com/en/latest/vectorstores/langchain_community.vectorstores.faiss.FAISS.html#langchain_community.vectorstores.faiss.FAISS.afrom_documents
-        # 3. Gather tasks with asyncio
-        # 4. Create `final_vectorstore` via merge of all vector stores:
-        #    https://api.python.langchain.com/en/latest/vectorstores/langchain_community.vectorstores.faiss.FAISS.html#langchain_community.vectorstores.faiss.FAISS.merge_from
-        # 6. Return `final_vectorstore`
-        raise NotImplementedError
+        """
+        Create a single FAISS vectorstore from documents by processing them in batches.
+
+        Batching helps to stay within embedding model context limits.
+        """
+        if not documents:
+            raise ValueError("No documents provided to build the vectorstore.")
+
+        # 1. Split documents into batches.
+        batches: list[list[Document]] = [
+            documents[i : i + batch_size] for i in range(0, len(documents), batch_size)
+        ]
+
+        # 2. Create async tasks for building partial FAISS indexes.
+        batch_tasks = [FAISS.afrom_documents(batch, self.embeddings) for batch in batches]
+
+        # 3. Run all embedding tasks concurrently.
+        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+        # 4. Merge all partial vectorstores into one.
+        final_vectorstore = None
+        for result in batch_results:
+            if isinstance(result, Exception):
+                # In a real system you might want better error handling.
+                print(f"Error while creating batch vectorstore: {result}")
+                continue
+
+            batch_vectorstore = result
+            if batch_vectorstore is None:
+                continue
+
+            if final_vectorstore is None:
+                final_vectorstore = batch_vectorstore
+            else:
+                final_vectorstore.merge_from(batch_vectorstore)
+
+        # 5. Validate that we have a final vectorstore and return it.
+        if final_vectorstore is None:
+            raise RuntimeError("Vectorstore creation failed for all batches.")
+
+        return final_vectorstore
 
     async def retrieve_context(self, query: str, k: int = 10, score: float = 0.1) -> str:
-        #TODO:
-        # 1. Make similarity search:
-        #    https://api.python.langchain.com/en/latest/vectorstores/langchain_community.vectorstores.faiss.FAISS.html#langchain_community.vectorstores.faiss.FAISS.similarity_search_with_relevance_scores
-        # 2. Create `context_parts` empty array (we will collect content here)
-        # 3. Iterate through retrieved relevant docs (pay attention that its tuple (doc, relevance_score)) and:
-        #       - add doc page content to `context_parts` and then print score and content
-        # 4. Return joined context from `context_parts` with `\n\n` spliterator (to enhance readability)
-        raise NotImplementedError
+        """
+        Retrieve a textual context from the vectorstore for a given query.
+        """
+        if self.vectorstore is None:
+            raise RuntimeError("Vectorstore is not initialized.")
+
+        # 1. Perform similarity search with relevance scores in a worker thread
+        #    so that we do not block the event loop.
+        results = await asyncio.to_thread(
+            self.vectorstore.similarity_search_with_relevance_scores,
+            query,
+            k=k,
+            score_threshold=score,
+        )
+
+        # 2. Collect page contents from the retrieved documents.
+        context_parts: list[str] = []
+        for doc, relevance_score in results:
+            context_parts.append(doc.page_content)
+            print(f"Retrieved (Score: {relevance_score:.3f}): {doc.page_content}")
+
+        # 3. Join context parts with extra newlines for readability.
+        return "\n\n".join(context_parts)
 
     def augment_prompt(self, query: str, context: str) -> str:
-        # TODO: Make augmentation for USER_PROMPT via `format` method
-        raise NotImplementedError
+        """Combine user query and retrieved context into a single prompt."""
+        return USER_PROMPT.format(context=context, query=query)
 
     def generate_answer(self, augmented_prompt: str) -> str:
-        #TODO:
-        # 1. Create messages array with:
-        #       - system prompt
-        #       - user prompt
-        # 2. Generate response
-        #    https://python.langchain.com/api_reference/openai/chat_models/langchain_openai.chat_models.azure.AzureChatOpenAI.html#langchain_openai.chat_models.azure.AzureChatOpenAI.invoke
-        # 3. Return response content
-        raise NotImplementedError
+        """
+        Call the chat model with the RAG-style prompt and return its answer.
+        """
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=augmented_prompt),
+        ]
+        response = self.llm_client.invoke(messages)
+        return response.content
 
 
 async def main():
+    embeddings = AzureOpenAIEmbeddings(
+        # Embedding model configuration.
+        deployment="text-embedding-3-small-1",
+        azure_endpoint=DIAL_URL,
+        api_key=SecretStr(API_KEY),
+        dimensions=384,
+    )
 
-    #TODO:
-    # 1. Create AzureOpenAIEmbeddings
-    #    embedding model 'text-embedding-3-small-1'
-    #    I would recommend to set up dimensions as 384
-    # 2. Create AzureChatOpenAI
+    llm_client = AzureChatOpenAI(
+        temperature=0.0,
+        azure_deployment="gpt-4o",
+        azure_endpoint=DIAL_URL,
+        api_key=SecretStr(API_KEY),
+        api_version="2024-02-15-preview",
+    )
 
     async with UserRAG(embeddings, llm_client) as rag:
         print("Query samples:")
         print(" - I need user emails that filled with hiking and psychology")
         print(" - Who is John?")
         while True:
-            user_question = input("> ").strip()
+            # Run blocking input in a worker thread so it does not block the event loop.
+            user_question = (await asyncio.to_thread(input, "> ")).strip()
             if user_question.lower() in ['quit', 'exit']:
                 break
-            #TODO:
-            # 1. Retrieve context
-            # 2. Make augmentation
-            # 3. Generate answer and print it
-            raise NotImplementedError
+            # 1. Retrieve relevant context from the vectorstore.
+            context = await rag.retrieve_context(user_question)
+            if not context:
+                print("No relevant information found in vector store.")
+                continue
+
+            # 2. Build an augmented prompt that combines context and question.
+            augmented_prompt = rag.augment_prompt(user_question, context)
+
+            # 3. Generate and print the answer.
+            answer = rag.generate_answer(augmented_prompt)
+            print("\nAnswer:")
+            print(answer)
 
 
 asyncio.run(main())
